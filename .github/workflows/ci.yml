@@ -1,0 +1,34 @@
+name: Brain Tumor MRI CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        run: |
+          python -m compileall backend frontend test_models.py test_prediction.py
+
+      - name: Check required files
+        run: |
+          test -f Dockerfile
+          test -f requirements.txt
+          test -f models/best_binary_resnet18.pth
+          test -f models/brain_tumor_resnet18_final.pth
+
+      - name: CI completed
+        run: echo "Brain Tumor MRI CI checks passed"
