@@ -22,18 +22,22 @@ app = FastAPI(
 # AZURE BLOB STORAGE
 # ============================================================
 
-AZURE_STORAGE_CONNECTION_STRING = os.environ.get(
+AZURE_STORAGE_CONNECTION_STRING = os.getenv(
     "AZURE_STORAGE_CONNECTION_STRING"
 )
 
 BLOB_CONTAINER_NAME = "prediction-logs"
 
 
-def save_prediction_log(filename, result):
-    """Save prediction metadata as a JSON file in Azure Blob Storage."""
+def save_prediction_log(filename: str, result: dict) -> bool:
+    """
+    Save prediction metadata as a JSON file
+    in Azure Blob Storage.
+    """
 
     if not AZURE_STORAGE_CONNECTION_STRING:
-        return
+        print("Blob logging skipped: AZURE_STORAGE_CONNECTION_STRING is not set.")
+        return False
 
     try:
         blob_service_client = BlobServiceClient.from_connection_string(
@@ -51,20 +55,34 @@ def save_prediction_log(filename, result):
         }
 
         blob_name = (
-            f"prediction_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-            f"_{uuid4().hex[:8]}.json"
+            "prediction_"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid4().hex[:8]}.json"
         )
 
-        blob_client = container_client.get_blob_client(blob_name)
+        blob_client = container_client.get_blob_client(
+            blob_name
+        )
 
         blob_client.upload_blob(
             json.dumps(log_data, indent=2),
             overwrite=False,
         )
 
+        print(
+            f"Prediction log successfully uploaded to Blob Storage: "
+            f"{blob_name}"
+        )
+
+        return True
+
     except Exception as error:
-        # Logging failure should NOT break MRI prediction.
-        print(f"Blob logging failed: {error}")
+        print(
+            f"Blob logging failed: "
+            f"{type(error).__name__}: {error}"
+        )
+
+        return False
 
 
 # ============================================================
@@ -88,7 +106,12 @@ def health():
 
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...)
+):
+    # --------------------------------------------------------
+    # FILE VALIDATION
+    # --------------------------------------------------------
 
     if not file.content_type:
         raise HTTPException(
@@ -103,6 +126,10 @@ async def predict(file: UploadFile = File(...)):
         )
 
     try:
+        # ----------------------------------------------------
+        # READ IMAGE
+        # ----------------------------------------------------
+
         image_bytes = await file.read()
 
         if not image_bytes:
@@ -110,6 +137,10 @@ async def predict(file: UploadFile = File(...)):
                 status_code=400,
                 detail="Uploaded file is empty.",
             )
+
+        # ----------------------------------------------------
+        # OPEN IMAGE
+        # ----------------------------------------------------
 
         image = Image.open(
             BytesIO(image_bytes)
@@ -121,6 +152,10 @@ async def predict(file: UploadFile = File(...)):
 
         result = predict_image(image)
 
+        # ----------------------------------------------------
+        # BUILD RESPONSE
+        # ----------------------------------------------------
+
         response_data = {
             "filename": file.filename,
             **result,
@@ -131,9 +166,13 @@ async def predict(file: UploadFile = File(...)):
         # ----------------------------------------------------
 
         save_prediction_log(
-            file.filename,
+            file.filename or "unknown",
             response_data,
         )
+
+        # ----------------------------------------------------
+        # RETURN PREDICTION
+        # ----------------------------------------------------
 
         return response_data
 
