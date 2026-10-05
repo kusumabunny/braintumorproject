@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.git
+.github
+.venv
+venv
+.env
+test_models.py
+test_prediction.py
