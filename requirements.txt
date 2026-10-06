@@ -7,4 +7,4 @@ pillow
 streamlit
 requests
 pandas
-azure-storage-blob
+azure-storage-blobtransformers
