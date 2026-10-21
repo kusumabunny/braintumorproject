@@ -7,29 +7,31 @@ from torchvision import models, transforms
 from transformers import CLIPModel, CLIPProcessor
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Paths
-# ---------------------------------------------------------
+# =========================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-BINARY_MODEL_PATH = PROJECT_ROOT / "models" / "best_binary_resnet18.pth"
+BINARY_MODEL_PATH = (
+    PROJECT_ROOT / "models" / "best_binary_resnet18.pth"
+)
 
 MULTICLASS_MODEL_PATH = (
     PROJECT_ROOT / "models" / "brain_tumor_resnet18_final.pth"
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Device
-# ---------------------------------------------------------
+# =========================================================
 
 DEVICE = torch.device("cpu")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Class names
-# ---------------------------------------------------------
+# =========================================================
 
 # Binary model:
 # 0 = No Tumor
@@ -55,9 +57,9 @@ MULTICLASS_CLASSES = {
 }
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Image preprocessing for ResNet
-# ---------------------------------------------------------
+# =========================================================
 
 transform = transforms.Compose(
     [
@@ -71,25 +73,20 @@ transform = transforms.Compose(
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CLIP configuration
-# ---------------------------------------------------------
+# =========================================================
 
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 
-# Minimum CLIP probability required to accept the image
-# as a brain MRI.
-#
-# If the probability is below this value, the image is
-# rejected as an unrelated image.
-CLIP_THRESHOLD = 0.60
+# Heuristic threshold for the MRI input-validation gate.
+# This is not a medically validated probability threshold.
+CLIP_THRESHOLD = 0.80
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Load CLIP
-# ---------------------------------------------------------
-
-print("Loading CLIP model...")
+# =========================================================
 
 clip_processor = CLIPProcessor.from_pretrained(
     CLIP_MODEL_NAME
@@ -102,12 +99,10 @@ clip_model = CLIPModel.from_pretrained(
 clip_model.to(DEVICE)
 clip_model.eval()
 
-print("CLIP model loaded successfully.")
 
-
-# ---------------------------------------------------------
+# =========================================================
 # Create Binary ResNet18
-# ---------------------------------------------------------
+# =========================================================
 
 def create_binary_model():
     model = models.resnet18(weights=None)
@@ -124,16 +119,15 @@ def create_binary_model():
     )
 
     model.load_state_dict(state_dict)
-
     model.to(DEVICE)
     model.eval()
 
     return model
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Create Multiclass ResNet18
-# ---------------------------------------------------------
+# =========================================================
 
 def create_multiclass_model():
     model = models.resnet18(weights=None)
@@ -150,57 +144,60 @@ def create_multiclass_model():
     )
 
     model.load_state_dict(state_dict)
-
     model.to(DEVICE)
     model.eval()
 
     return model
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Load ResNet models once
-# ---------------------------------------------------------
-
-print("Loading binary model...")
+# =========================================================
 
 binary_model = create_binary_model()
-
-print("Binary model loaded successfully.")
-
-
-print("Loading multiclass model...")
-
 multiclass_model = create_multiclass_model()
 
-print("Multiclass model loaded successfully.")
 
-
-# ---------------------------------------------------------
+# =========================================================
 # CLIP MRI validation
-# ---------------------------------------------------------
+# =========================================================
 
 def check_if_brain_mri(image: Image.Image):
     """
-    Use CLIP to determine whether the uploaded image
-    appears to be a brain MRI or an unrelated image.
+    Use CLIP as a heuristic input-validation gate.
 
-    Returns:
-        is_brain_mri: bool
-        confidence: float
+    CLIP scores are image-text similarity scores, not
+    calibrated probabilities. This gate can reject obvious
+    unrelated images, but it is not a guaranteed MRI detector.
     """
 
     image = image.convert("RGB")
 
-    text_prompts = [
-        "a brain MRI scan",
-        "a medical MRI image of the human brain",
-        "an MRI scan of a human brain",
-        "a brain medical imaging scan",
-        "an unrelated image",
-        "a photograph that is not a medical image",
-        "a non-medical image",
-        "an image that is not a brain MRI",
+    mri_prompts = [
+        "a grayscale axial brain MRI scan showing the brain",
+        "a clinical radiology image of a human brain MRI",
+        "a T1 weighted magnetic resonance image of the brain",
+        "a T2 weighted magnetic resonance image of the brain",
+        "a medical scan of the human brain from an MRI machine",
+        "a cross-sectional MRI image of the human brain",
     ]
+
+    non_mri_prompts = [
+        "a photograph of a banana",
+        "a photograph of fruit",
+        "a photograph of a person",
+        "a photograph of an animal",
+        "a photograph of a car",
+        "a photograph of a building",
+        "a photograph of an everyday object",
+        "a natural landscape photograph",
+        "a screenshot of a computer application",
+        "a medical photograph that is not an MRI scan",
+        "a CT scan or X-ray image, not an MRI",
+        "a drawing or cartoon",
+    ]
+
+    text_prompts = mri_prompts + non_mri_prompts
 
     inputs = clip_processor(
         text=text_prompts,
@@ -215,128 +212,123 @@ def check_if_brain_mri(image: Image.Image):
     }
 
     with torch.no_grad():
-
         outputs = clip_model(**inputs)
+        logits = outputs.logits_per_image[0]
 
-        logits = outputs.logits_per_image
+    # Separate MRI and non-MRI image-text scores.
+    mri_logits = logits[:len(mri_prompts)]
+    non_mri_logits = logits[len(mri_prompts):]
 
-        probabilities = torch.softmax(
-            logits,
-            dim=1,
-        )[0]
+    # Compare the strongest matching prompt in each group.
+    best_mri_score = mri_logits.max()
+    best_non_mri_score = non_mri_logits.max()
 
-    # First four prompts represent brain MRI.
-    brain_mri_probability = probabilities[:4].mean().item()
-
-    # Last four prompts represent unrelated/non-MRI.
-    unrelated_probability = probabilities[4:].mean().item()
-
-    total_probability = (
-        brain_mri_probability
-        + unrelated_probability
+    # Relative two-group score. This is not a calibrated
+    # probability that the image is actually a brain MRI.
+    group_probabilities = torch.softmax(
+        torch.stack(
+            [
+                best_mri_score,
+                best_non_mri_score,
+            ]
+        ),
+        dim=0,
     )
 
-    # Normalize the two groups.
-    if total_probability > 0:
-        brain_mri_score = (
-            brain_mri_probability
-            / total_probability
-        )
-    else:
-        brain_mri_score = 0.0
+    mri_probability = group_probabilities[0].item()
+    non_mri_probability = group_probabilities[1].item()
 
     is_brain_mri = (
-        brain_mri_score >= CLIP_THRESHOLD
+        mri_probability >= CLIP_THRESHOLD
+        and best_mri_score.item() > best_non_mri_score.item()
     )
 
-    return (
-        is_brain_mri,
-        brain_mri_score,
+    print(
+        "[CLIP DEBUG] "
+        f"MRI score={best_mri_score.item():.4f}, "
+        f"non-MRI score={best_non_mri_score.item():.4f}, "
+        f"MRI relative score={mri_probability:.4f}, "
+        f"non-MRI relative score={non_mri_probability:.4f}, "
+        f"accepted={is_brain_mri}"
     )
 
+    return is_brain_mri, mri_probability
 
-# ---------------------------------------------------------
-# Prediction function
-# ---------------------------------------------------------
+
+# =========================================================
+# Main prediction function
+# =========================================================
 
 def predict_image(image: Image.Image):
     """
-    Complete prediction pipeline:
+    Prediction pipeline:
 
-    1. CLIP validates whether the image appears to be
-       a brain MRI.
-    2. Binary ResNet18 predicts Tumor / No Tumor.
-    3. If Tumor, multiclass ResNet18 predicts tumor type.
+        Uploaded image
+              |
+              v
+        CLIP input validation
+              |
+        +-----+-----+
+        |           |
+      Reject       Accept
+        |           |
+        v           v
+      Unrelated   Binary ResNet18
+                      |
+                +-----+-----+
+                |           |
+             No Tumor      Tumor
+                |           |
+                v           v
+             No Tumor   Multiclass ResNet18
+                            |
+                     Glioma / Meningioma /
+                           Pituitary
+
+    This is an experimental ML project, not a medical
+    diagnostic system.
     """
-
-    # -----------------------------------------------------
-    # Safety check
-    # -----------------------------------------------------
 
     if image is None:
         raise ValueError("Image cannot be None.")
 
     image = image.convert("RGB")
 
+    # =====================================================
+    # STEP 1: Validate input with CLIP
+    # =====================================================
 
-    # -----------------------------------------------------
-    # STEP 1: CLIP unrelated-image detection
-    # -----------------------------------------------------
+    is_brain_mri, _ = check_if_brain_mri(image)
 
-    is_brain_mri, clip_confidence = check_if_brain_mri(
-        image
-    )
-
-    print(
-        f"CLIP brain MRI confidence: "
-        f"{clip_confidence * 100:.2f}%"
-    )
-
-
-    # -----------------------------------------------------
-    # Reject unrelated images
-    # -----------------------------------------------------
+    # =====================================================
+    # STEP 2: Reject images that fail the validation gate
+    # =====================================================
 
     if not is_brain_mri:
+        print("[PREDICTION] Rejected by CLIP input validation.")
 
         return {
             "binary_prediction": "Unrelated Image",
-            "binary_confidence": round(
-                (1 - clip_confidence) * 100,
-                2,
-            ),
+            "binary_confidence": 0.0,
             "tumor_type": "Unrelated Image",
             "tumor_confidence": 0.0,
             "final_prediction": "Unrelated Image",
-            "final_confidence": round(
-                (1 - clip_confidence) * 100,
-                2,
-            ),
+            "final_confidence": 0.0,
         }
 
-
-    # -----------------------------------------------------
-    # STEP 2: ResNet preprocessing
-    # -----------------------------------------------------
+    # =====================================================
+    # STEP 3: Preprocess the accepted image
+    # =====================================================
 
     input_tensor = transform(image)
+    input_tensor = input_tensor.unsqueeze(0).to(DEVICE)
 
-    input_tensor = (
-        input_tensor
-        .unsqueeze(0)
-        .to(DEVICE)
-    )
-
-
-    # -----------------------------------------------------
-    # STEP 3: Binary prediction
-    # -----------------------------------------------------
+    # =====================================================
+    # STEP 4: Binary ResNet18 prediction
+    # =====================================================
 
     with torch.no_grad():
-
-        binary_output = binary_model(
-            input_tensor
-        )
+        binary_output = binary_model(input_tensor)
 
         binary_probabilities = torch.softmax(
             binary_output,
@@ -348,85 +340,106 @@ def predict_image(image: Image.Image):
             dim=1,
         )
 
-        binary_index = binary_class.item()
+    binary_index = binary_class.item()
+    binary_confidence_value = binary_confidence.item()
 
-        binary_confidence_value = (
-            binary_confidence.item()
-        )
+    binary_prediction = BINARY_CLASSES[binary_index]
 
-        binary_prediction = BINARY_CLASSES[
-            binary_index
-        ]
+    print(
+        f"[BINARY MODEL] Prediction={binary_prediction}, "
+        f"confidence={binary_confidence_value:.4f}"
+    )
 
-
-        # -------------------------------------------------
-        # STEP 4: Multiclass prediction
-        # -------------------------------------------------
-
-        multiclass_output = multiclass_model(
-            input_tensor
-        )
-
-        multiclass_probabilities = torch.softmax(
-            multiclass_output,
-            dim=1,
-        )
-
-        multiclass_confidence, multiclass_class = torch.max(
-            multiclass_probabilities,
-            dim=1,
-        )
-
-        multiclass_index = multiclass_class.item()
-
-        multiclass_confidence_value = (
-            multiclass_confidence.item()
-        )
-
-        tumor_type = MULTICLASS_CLASSES[
-            multiclass_index
-        ]
-
-
-    # -----------------------------------------------------
-    # STEP 5: Final result
-    # -----------------------------------------------------
+    # =====================================================
+    # STEP 5: If No Tumor, stop here
+    # =====================================================
 
     if binary_prediction == "No Tumor":
-
-        final_prediction = "No Tumor"
-
-        final_confidence = (
-            binary_confidence_value
+        confidence_percent = round(
+            binary_confidence_value * 100,
+            2,
         )
 
-    else:
+        return {
+            "binary_prediction": "No Tumor",
+            "binary_confidence": confidence_percent,
+            "tumor_type": "No Tumor",
+            "tumor_confidence": 0.0,
+            "final_prediction": "No Tumor",
+            "final_confidence": confidence_percent,
+        }
 
-        final_prediction = tumor_type
+    # =====================================================
+    # STEP 6: Multiclass tumor classification
+    # =====================================================
 
-        final_confidence = (
-            multiclass_confidence_value
+    # Original class mapping:
+    # 0 = Glioma
+    # 1 = Meningioma
+    # 2 = No Tumor
+    # 3 = Pituitary
+    #
+    # Since the binary model predicted Tumor, exclude
+    # the No Tumor output from the tumor-type decision.
+
+    with torch.no_grad():
+        multiclass_output = multiclass_model(input_tensor)
+        multiclass_logits = multiclass_output[0]
+
+        tumor_logits = torch.stack(
+            [
+                multiclass_logits[0],  # Glioma
+                multiclass_logits[1],  # Meningioma
+                multiclass_logits[3],  # Pituitary
+            ]
         )
 
+        tumor_probabilities = torch.softmax(
+            tumor_logits,
+            dim=0,
+        )
 
-    # -----------------------------------------------------
-    # Return result
-    # -----------------------------------------------------
+        tumor_confidence, tumor_class = torch.max(
+            tumor_probabilities,
+            dim=0,
+        )
+
+    filtered_index = tumor_class.item()
+    tumor_confidence_value = tumor_confidence.item()
+
+    # Map filtered indices back to original class indices.
+    tumor_class_mapping = {
+        0: 0,  # Glioma
+        1: 1,  # Meningioma
+        2: 3,  # Pituitary
+    }
+
+    original_class_index = tumor_class_mapping[filtered_index]
+    tumor_type = MULTICLASS_CLASSES[original_class_index]
+
+    print(
+        f"[MULTICLASS MODEL] Prediction={tumor_type}, "
+        f"confidence={tumor_confidence_value:.4f}"
+    )
+
+    # =====================================================
+    # STEP 7: Return prediction
+    # =====================================================
 
     return {
-        "binary_prediction": binary_prediction,
+        "binary_prediction": "Tumor",
         "binary_confidence": round(
             binary_confidence_value * 100,
             2,
         ),
         "tumor_type": tumor_type,
         "tumor_confidence": round(
-            multiclass_confidence_value * 100,
+            tumor_confidence_value * 100,
             2,
         ),
-        "final_prediction": final_prediction,
+        "final_prediction": tumor_type,
         "final_confidence": round(
-            final_confidence * 100,
+            tumor_confidence_value * 100,
             2,
         ),
     }

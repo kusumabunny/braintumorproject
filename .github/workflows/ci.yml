@@ -18,17 +18,29 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest ruff mypy
 
       - name: Check Python syntax
-        run: |
-          python -m compileall backend frontend test_models.py test_prediction.py
+        run: python -m compileall backend frontend test_models.py test_prediction.py
 
-      - name: Check required files
-        run: |
-          test -f Dockerfile
-          test -f requirements.txt
-          test -f models/best_binary_resnet18.pth
-          test -f models/brain_tumor_resnet18_final.pth
+      - name: Lint code
+        run: ruff check backend frontend
 
-      - name: CI completed
-        run: echo "Brain Tumor MRI CI checks passed"
+      - name: Type check
+        run: mypy backend
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Build backend Docker image
+        run: docker build -f Dockerfile -t brain-tumor-backend .
+
+      - name: Build frontend Docker image
+        run: docker build -f Dockerfile.frontend -t brain-tumor-frontend .

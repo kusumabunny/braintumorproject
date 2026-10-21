@@ -10,7 +10,11 @@ import streamlit as st
 # CONFIGURATION
 # ============================================================
 
-BACKEND_URL = "https://brain-tumor-api-2026.azurewebsites.net"
+BACKEND_URL = os.getenv(
+    "BACKEND_URL",
+    "https://brain-tumor-api-2026.azurewebsites.net",
+).rstrip("/")
+
 PREDICT_URL = f"{BACKEND_URL}/predict"
 
 
