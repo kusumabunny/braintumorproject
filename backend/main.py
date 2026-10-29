@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from io import BytesIO
 from uuid import uuid4
 
@@ -48,14 +48,14 @@ def save_prediction_log(filename: str, result: dict) -> bool:
         )
 
         log_data = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "filename": filename,
             **result,
         }
 
         blob_name = (
             "prediction_"
-            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+            f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_"
             f"{uuid4().hex[:8]}.json"
         )
 
