@@ -31,6 +31,7 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
@@ -129,15 +130,60 @@ jobs:
                       memoryInGB: 1.5
           EOF
 
-          # Recreate the group so image/config changes always apply cleanly.
-          if az container show --resource-group "$RESOURCE_GROUP" --name "$ACI_NAME" --output none 2>/dev/null; then
-            az container delete --resource-group "$RESOURCE_GROUP" --name "$ACI_NAME" --yes --output none
-          fi
+          ACI=(--resource-group "$RESOURCE_GROUP" --name "$ACI_NAME")
 
-          az container create --resource-group "$RESOURCE_GROUP" --file aci.yaml --output none
+          CURRENT=$(az container show "${ACI[@]}" \
+            --query "join(',', [provisioningState, containers[?name=='backend'].image | [0], containers[?name=='frontend'].image | [0]])" \
+            -o tsv 2>/dev/null || true)
+
+          if [ "$CURRENT" = "Succeeded,$BACKEND_IMAGE,$FRONTEND_IMAGE" ]; then
+            # Same images already deployed and healthy: reuse as-is.
+            echo "Container group '$ACI_NAME' already runs these images; skipping deploy."
+          elif [ -n "$CURRENT" ]; then
+            # Group exists: update it in place (keeps the same IP and DNS name).
+            # ACI rejects in-place changes to things like CPU/memory, so fall
+            # back to delete + create only when the update itself is refused.
+            echo "Updating existing container group '$ACI_NAME' in place..."
+            if ! az container create --resource-group "$RESOURCE_GROUP" --file aci.yaml --no-wait --output none; then
+              echo "::warning::In-place update refused; recreating the container group."
+              az container delete "${ACI[@]}" --yes --output none
+              az container create --resource-group "$RESOURCE_GROUP" --file aci.yaml --no-wait --output none
+            fi
+          else
+            echo "Creating container group '$ACI_NAME'..."
+            az container create --resource-group "$RESOURCE_GROUP" --file aci.yaml --no-wait --output none
+          fi
           rm -f aci.yaml
 
-          FQDN=$(az container show --resource-group "$RESOURCE_GROUP" --name "$ACI_NAME" --query ipAddress.fqdn -o tsv)
+          # Poll instead of blocking, so a stuck deploy shows why and fails
+          # after 15 minutes rather than hanging the workflow.
+          for i in $(seq 1 45); do
+            STATUS=$(az container show "${ACI[@]}" \
+              --query "join(' | ', [provisioningState, containers[?name=='backend'].image | [0], containers[?name=='backend'].instanceView.currentState.state | [0] || 'n/a', to_string(containers[?name=='backend'].instanceView.restartCount | [0] || \`0\`)])" \
+              -o tsv 2>/dev/null || echo "not visible yet")
+            echo "[$i] provisioning | backend image | backend state | restarts = $STATUS"
+
+            IFS='|' read -r PROV IMG STATE RESTARTS <<< "$(echo "$STATUS" | tr -d ' ')"
+            if [ "$PROV" = "Succeeded" ] && [ "$IMG" = "$BACKEND_IMAGE" ] && [ "$STATE" = "Running" ]; then
+              break
+            fi
+            # Only count restarts once the new image is in place, so a crash
+            # loop left over from a previous deploy doesn't fail this one.
+            if [ "$PROV" = "Failed" ] || { [ "$IMG" = "$BACKEND_IMAGE" ] && [ "${RESTARTS:-0}" -ge 3 ] 2>/dev/null; }; then
+              echo "::error::Container group failed to start (provisioning=$PROV, backend restarts=$RESTARTS)"
+              az container show "${ACI[@]}" --query "containers[].instanceView.events[-5:].{container:name, event:name, message:message}" -o table || true
+              az container logs "${ACI[@]}" --container-name backend || true
+              exit 1
+            fi
+            if [ "$i" = 45 ]; then
+              echo "::error::Container group not running after 15 minutes"
+              az container show "${ACI[@]}" --query "containers[].instanceView.events[-5:].{container:name, event:name, message:message}" -o table || true
+              exit 1
+            fi
+            sleep 20
+          done
+
+          FQDN=$(az container show "${ACI[@]}" --query ipAddress.fqdn -o tsv)
           echo "FQDN=$FQDN" >> "$GITHUB_ENV"
           echo "Frontend: http://$FQDN:8501"
           echo "Backend:  http://$FQDN:8000/docs"
