@@ -1,54 +1,164 @@
-name: CD - Deploy Brain Tumor API to Azure
+name: CD - Deploy Brain Tumor App to Azure
 
+# Deploy only after the CI workflow has passed for a push to main.
+# Can also be triggered manually from the Actions tab.
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["Brain Tumor MRI CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
+  packages: write # push images to ghcr.io
+  id-token: write # OIDC login to Azure
+
+concurrency:
+  group: cd-azure
+  cancel-in-progress: false
 
 env:
-  ACR_LOGIN_SERVER: braintumoracr2026.azurecr.io
-  IMAGE_NAME: brain-tumor-api
-  WEBAPP_NAME: brain-tumor-api-2026
+  REGISTRY: ghcr.io
+  IMAGE_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+  RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  ACI_NAME: ${{ vars.ACI_NAME }}
 
 jobs:
   build-and-deploy:
-
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.IMAGE_TAG }}
+          lfs: true # model weights (*.pth) are stored in Git LFS
 
-      - name: Login to Azure
+      - name: Verify model weights were downloaded
+        run: |
+          for f in models/*.pth; do
+            size=$(stat -c%s "$f")
+            echo "$f: $size bytes"
+            if [ "$size" -lt 1000000 ]; then
+              echo "::error::$f looks like a Git LFS pointer, not the real model file"
+              exit 1
+            fi
+          done
+
+      - name: Set image names
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "OWNER=$OWNER" >> "$GITHUB_ENV"
+          echo "BACKEND_IMAGE=${{ env.REGISTRY }}/$OWNER/brain-tumor-api:${{ env.IMAGE_TAG }}" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=${{ env.REGISTRY }}/$OWNER/brain-tumor-frontend:${{ env.IMAGE_TAG }}" >> "$GITHUB_ENV"
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push backend image
+        run: |
+          docker build -f Dockerfile -t "$BACKEND_IMAGE" .
+          docker push "$BACKEND_IMAGE"
+
+      - name: Build and push frontend image
+        run: |
+          docker build -f Dockerfile.frontend -t "$FRONTEND_IMAGE" .
+          docker push "$FRONTEND_IMAGE"
+
+      - name: Login to Azure (OIDC)
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Login to Azure Container Registry
-  uses: docker/login-action@v4
-  with:
-    registry: ${{ env.ACR_LOGIN_SERVER }}
-    username: ${{ secrets.ACR_USERNAME }}
-    password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build Docker image
+      # Backend and frontend run in one container group, so the frontend
+      # reaches the API over localhost. Both ports are exposed publicly.
+      - name: Deploy to Azure Container Instances
         run: |
-          docker build -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          LOCATION=$(az group show --name "$RESOURCE_GROUP" --query location -o tsv)
+          DNS_LABEL=$(echo "$ACI_NAME-$OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "DNS_LABEL=$DNS_LABEL" >> "$GITHUB_ENV"
 
-      - name: Push Docker image
+          cat > aci.yaml <<EOF
+          apiVersion: 2021-10-01
+          location: $LOCATION
+          name: $ACI_NAME
+          type: Microsoft.ContainerInstance/containerGroups
+          properties:
+            osType: Linux
+            restartPolicy: Always
+            imageRegistryCredentials:
+              - server: ${{ env.REGISTRY }}
+                username: '$OWNER'
+                password: '${{ secrets.GHCR_TOKEN }}'
+            ipAddress:
+              type: Public
+              dnsNameLabel: $DNS_LABEL
+              ports:
+                - protocol: tcp
+                  port: 8000
+                - protocol: tcp
+                  port: 8501
+            containers:
+              - name: backend
+                properties:
+                  image: $BACKEND_IMAGE
+                  ports:
+                    - port: 8000
+                  resources:
+                    requests:
+                      cpu: 2
+                      memoryInGB: 4
+              - name: frontend
+                properties:
+                  image: $FRONTEND_IMAGE
+                  ports:
+                    - port: 8501
+                  environmentVariables:
+                    - name: BACKEND_URL
+                      value: http://localhost:8000
+                  resources:
+                    requests:
+                      cpu: 1
+                      memoryInGB: 1.5
+          EOF
+
+          # Recreate the group so image/config changes always apply cleanly.
+          if az container show --resource-group "$RESOURCE_GROUP" --name "$ACI_NAME" --output none 2>/dev/null; then
+            az container delete --resource-group "$RESOURCE_GROUP" --name "$ACI_NAME" --yes --output none
+          fi
+
+          az container create --resource-group "$RESOURCE_GROUP" --file aci.yaml --output none
+          rm -f aci.yaml
+
+          FQDN=$(az container show --resource-group "$RESOURCE_GROUP" --name "$ACI_NAME" --query ipAddress.fqdn -o tsv)
+          echo "FQDN=$FQDN" >> "$GITHUB_ENV"
+          echo "Frontend: http://$FQDN:8501"
+          echo "Backend:  http://$FQDN:8000/docs"
+
+      - name: Wait for backend to come up
         run: |
-          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-      - name: Deploy container to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: ${{ env.WEBAPP_NAME }}
-          images: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://$FQDN:8000/docs" || true)
+            echo "Attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+              echo "- Frontend: http://$FQDN:8501" >> "$GITHUB_STEP_SUMMARY"
+              echo "- Backend: http://$FQDN:8000/docs" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::Backend did not respond within 10 minutes"
+          az container logs --resource-group "$RESOURCE_GROUP" --name "$ACI_NAME" --container-name backend || true
+          exit 1
 
       - name: Azure logout
-        run: |
-          az logout
+        if: always()
+        run: az logout || true

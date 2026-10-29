@@ -1,15 +1,14 @@
-from io import BytesIO
 import json
 import os
 from datetime import datetime, timezone
+from io import BytesIO
 from uuid import uuid4
 
+from azure.storage.blob import BlobServiceClient
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
-from azure.storage.blob import BlobServiceClient
 
 from backend.predictor import predict_image
-
 
 app = FastAPI(
     title="Brain Tumor MRI Classifier API",
@@ -107,7 +106,7 @@ def health():
 
 @app.post("/predict")
 async def predict(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),  # noqa: B008
 ):
     # --------------------------------------------------------
     # FILE VALIDATION

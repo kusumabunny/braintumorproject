@@ -1,11 +1,10 @@
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 from PIL import Image
+from torch import nn
 from torchvision import models, transforms
 from transformers import CLIPModel, CLIPProcessor
-
 
 # =========================================================
 # Paths
