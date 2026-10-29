@@ -95,7 +95,7 @@ clip_model = CLIPModel.from_pretrained(
     CLIP_MODEL_NAME
 )
 
-clip_model.to(DEVICE)
+clip_model.to(DEVICE)  # type: ignore[arg-type]  # transformers stub quirk
 clip_model.eval()
 
 
@@ -339,7 +339,7 @@ def predict_image(image: Image.Image):
             dim=1,
         )
 
-    binary_index = binary_class.item()
+    binary_index = int(binary_class.item())
     binary_confidence_value = binary_confidence.item()
 
     binary_prediction = BINARY_CLASSES[binary_index]
@@ -403,7 +403,7 @@ def predict_image(image: Image.Image):
             dim=0,
         )
 
-    filtered_index = tumor_class.item()
+    filtered_index = int(tumor_class.item())
     tumor_confidence_value = tumor_confidence.item()
 
     # Map filtered indices back to original class indices.

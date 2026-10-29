@@ -75,7 +75,7 @@ def save_prediction_log(filename: str, result: dict) -> bool:
 
         return True
 
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - logging must never break a prediction
         print(
             f"Blob logging failed: "
             f"{type(error).__name__}: {error}"

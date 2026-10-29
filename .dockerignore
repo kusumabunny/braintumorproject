@@ -7,3 +7,4 @@ venv
 .env
 test_models.py
 test_prediction.py
+tests

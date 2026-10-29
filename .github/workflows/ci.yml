@@ -24,11 +24,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
-          pip install pytest ruff mypy
+          pip install pytest httpx ruff mypy
 
       - name: Check Python syntax
-        run: python -m compileall backend frontend test_models.py test_prediction.py
+        run: python -m compileall backend frontend tests test_models.py test_prediction.py
 
       - name: Lint code
         run: ruff check backend frontend
