@@ -1,5 +1,10 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
 
 [tool.mypy]
+python_version = "3.11"
 ignore_missing_imports = true
