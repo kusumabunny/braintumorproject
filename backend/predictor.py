@@ -78,9 +78,45 @@ transform = transforms.Compose(
 
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 
-# Heuristic threshold for the MRI input-validation gate.
-# This is not a medically validated probability threshold.
-CLIP_THRESHOLD = 0.80
+# Heuristic threshold for the MRI input-validation gate: the share of
+# softmax probability (over all prompts) that lands on the MRI prompts.
+# On 158 real MRIs the lowest share was 0.65; the highest non-MRI
+# (grayscale brain drawing) was 0.47. Not a medically validated value.
+CLIP_THRESHOLD = 0.55
+
+# Brain MRIs are grayscale. Mean per-pixel channel difference above this
+# value means the upload is a colour image (fruit, cars, people, ...).
+# Real MRIs measured 0.0; colour photos measured 11-91.
+MAX_COLORFULNESS = 10.0
+
+MRI_PROMPTS = [
+    "a grayscale axial brain MRI scan showing the brain",
+    "a clinical radiology image of a human brain MRI",
+    "a T1 weighted magnetic resonance image of the brain",
+    "a T2 weighted magnetic resonance image of the brain",
+    "a medical scan of the human brain from an MRI machine",
+    "a cross-sectional MRI image of the human brain",
+]
+
+NON_MRI_PROMPTS = [
+    "a photograph of a banana",
+    "a photograph of fruit",
+    "a photograph of food",
+    "a grayscale photograph of food",
+    "a photograph of a person",
+    "a photograph of an animal",
+    "a photograph of a car",
+    "a photograph of a building",
+    "a photograph of an everyday object",
+    "a natural landscape photograph",
+    "a black and white photograph",
+    "a screenshot of a computer application",
+    "a scanned text document",
+    "a medical photograph that is not an MRI scan",
+    "a CT scan or X-ray image, not an MRI",
+    "a drawing or cartoon",
+    "an anatomical illustration or diagram of the brain",
+]
 
 
 # =========================================================
@@ -161,42 +197,53 @@ multiclass_model = create_multiclass_model()
 # CLIP MRI validation
 # =========================================================
 
+def colorfulness(image: Image.Image) -> float:
+    """
+    Mean absolute difference between colour channels (0-255 scale).
+    Grayscale images such as MRI scans score ~0.
+    """
+
+    pixels = transforms.functional.pil_to_tensor(
+        image.convert("RGB").resize((224, 224))
+    ).float()
+
+    red, green, blue = pixels[0], pixels[1], pixels[2]
+
+    difference = (
+        (red - green).abs()
+        + (green - blue).abs()
+        + (red - blue).abs()
+    )
+
+    return difference.mean().item() / 3
+
+
 def check_if_brain_mri(image: Image.Image):
     """
-    Use CLIP as a heuristic input-validation gate.
+    Heuristic input-validation gate:
 
-    CLIP scores are image-text similarity scores, not
-    calibrated probabilities. This gate can reject obvious
-    unrelated images, but it is not a guaranteed MRI detector.
+    1. Reject colour images (MRI scans are grayscale).
+    2. Use CLIP zero-shot scores against MRI and non-MRI
+       prompts; accept when the MRI prompts receive at least
+       CLIP_THRESHOLD of the total probability.
+
+    CLIP cannot reliably tell a brain CT from a brain MRI, so this
+    gate rejects unrelated images but is not a guaranteed MRI detector.
     """
 
     image = image.convert("RGB")
 
-    mri_prompts = [
-        "a grayscale axial brain MRI scan showing the brain",
-        "a clinical radiology image of a human brain MRI",
-        "a T1 weighted magnetic resonance image of the brain",
-        "a T2 weighted magnetic resonance image of the brain",
-        "a medical scan of the human brain from an MRI machine",
-        "a cross-sectional MRI image of the human brain",
-    ]
+    image_colorfulness = colorfulness(image)
 
-    non_mri_prompts = [
-        "a photograph of a banana",
-        "a photograph of fruit",
-        "a photograph of a person",
-        "a photograph of an animal",
-        "a photograph of a car",
-        "a photograph of a building",
-        "a photograph of an everyday object",
-        "a natural landscape photograph",
-        "a screenshot of a computer application",
-        "a medical photograph that is not an MRI scan",
-        "a CT scan or X-ray image, not an MRI",
-        "a drawing or cartoon",
-    ]
+    if image_colorfulness > MAX_COLORFULNESS:
+        print(
+            "[MRI GATE] "
+            f"colorfulness={image_colorfulness:.2f} > "
+            f"{MAX_COLORFULNESS}, accepted=False"
+        )
+        return False, 0.0
 
-    text_prompts = mri_prompts + non_mri_prompts
+    text_prompts = MRI_PROMPTS + NON_MRI_PROMPTS
 
     inputs = clip_processor(
         text=text_prompts,
@@ -214,40 +261,27 @@ def check_if_brain_mri(image: Image.Image):
         outputs = clip_model(**inputs)
         logits = outputs.logits_per_image[0]
 
-    # Separate MRI and non-MRI image-text scores.
-    mri_logits = logits[:len(mri_prompts)]
-    non_mri_logits = logits[len(mri_prompts):]
+    # Softmax over every prompt, then add up the probability that
+    # lands on the MRI prompts. Summing over all prompts is far more
+    # stable than comparing only the single best prompt per group.
+    prompt_probabilities = torch.softmax(logits, dim=0)
 
-    # Compare the strongest matching prompt in each group.
-    best_mri_score = mri_logits.max()
-    best_non_mri_score = non_mri_logits.max()
-
-    # Relative two-group score. This is not a calibrated
-    # probability that the image is actually a brain MRI.
-    group_probabilities = torch.softmax(
-        torch.stack(
-            [
-                best_mri_score,
-                best_non_mri_score,
-            ]
-        ),
-        dim=0,
+    mri_probability = (
+        prompt_probabilities[:len(MRI_PROMPTS)].sum().item()
     )
 
-    mri_probability = group_probabilities[0].item()
-    non_mri_probability = group_probabilities[1].item()
+    is_brain_mri = mri_probability >= CLIP_THRESHOLD
 
-    is_brain_mri = (
-        mri_probability >= CLIP_THRESHOLD
-        and best_mri_score.item() > best_non_mri_score.item()
-    )
+    best_non_mri_prompt = NON_MRI_PROMPTS[
+        int(prompt_probabilities[len(MRI_PROMPTS):].argmax().item())
+    ]
 
     print(
-        "[CLIP DEBUG] "
-        f"MRI score={best_mri_score.item():.4f}, "
-        f"non-MRI score={best_non_mri_score.item():.4f}, "
-        f"MRI relative score={mri_probability:.4f}, "
-        f"non-MRI relative score={non_mri_probability:.4f}, "
+        "[MRI GATE] "
+        f"colorfulness={image_colorfulness:.2f}, "
+        f"MRI share={mri_probability:.4f} "
+        f"(threshold {CLIP_THRESHOLD}), "
+        f"closest non-MRI prompt='{best_non_mri_prompt}', "
         f"accepted={is_brain_mri}"
     )
 

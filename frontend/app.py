@@ -10,9 +10,10 @@ import streamlit as st
 # CONFIGURATION
 # ============================================================
 
+# Local default; the Azure deployment sets BACKEND_URL explicitly.
 BACKEND_URL = os.getenv(
     "BACKEND_URL",
-    "https://brain-tumor-api-2026.azurewebsites.net",
+    "http://localhost:8000",
 ).rstrip("/")
 
 PREDICT_URL = f"{BACKEND_URL}/predict"
