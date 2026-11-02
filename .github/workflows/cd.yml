@@ -133,11 +133,11 @@ jobs:
           ACI=(--resource-group "$RESOURCE_GROUP" --name "$ACI_NAME")
 
           CURRENT=$(az container show "${ACI[@]}" \
-            --query "join(',', [provisioningState, containers[?name=='backend'].image | [0], containers[?name=='frontend'].image | [0]])" \
+            --query "join(',', [provisioningState, instanceView.state, containers[?name=='backend'].image | [0], containers[?name=='frontend'].image | [0]])" \
             -o tsv 2>/dev/null || true)
 
-          if [ "$CURRENT" = "Succeeded,$BACKEND_IMAGE,$FRONTEND_IMAGE" ]; then
-            # Same images already deployed and healthy: reuse as-is.
+          if [ "$CURRENT" = "Succeeded,Running,$BACKEND_IMAGE,$FRONTEND_IMAGE" ]; then
+            # Same images already deployed and running: reuse as-is.
             echo "Container group '$ACI_NAME' already runs these images; skipping deploy."
           elif [ -n "$CURRENT" ]; then
             # Group exists: update it in place (keeps the same IP and DNS name).
